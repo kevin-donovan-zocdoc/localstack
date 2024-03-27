@@ -255,6 +255,7 @@ jobs:
           name: Test CloudWatch v2 provider
           environment:
             PROVIDER_OVERRIDE_CLOUDWATCH: "v2"
+            DEBUG: 1
             TEST_PATH: "tests/aws/services/cloudwatch/"
             COVERAGE_ARGS: "-p"
           command: |
