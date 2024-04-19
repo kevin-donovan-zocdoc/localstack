@@ -1267,7 +1267,7 @@ class SubscriptionFilter:
         """
         flattened = []
 
-        def _traverse(_policy: dict, parent_key=None, current_rule=None, depth=0):
+        def _traverse(_policy: dict, parent_key=None, current_rule=None):
             if not current_rule:
                 current_rule = {}
 
@@ -1275,7 +1275,7 @@ class SubscriptionFilter:
                 pol = {k: v for k, v in _policy.items() if k != "$or"}
                 for value in or_val:
                     p = {**value, **pol}
-                    _traverse(p, parent_key=parent_key, current_rule={**current_rule}, depth=depth)
+                    _traverse(p, parent_key=parent_key, current_rule={**current_rule})
 
             else:
                 for key, values in _policy.items():
@@ -1288,7 +1288,6 @@ class SubscriptionFilter:
                             values,
                             parent_key=flattened_parent_key,
                             current_rule=current_rule,
-                            depth=depth + 1,
                         )
 
             # this check is to validate we're properly at the end node, and that we can safely "commit" the rule before
