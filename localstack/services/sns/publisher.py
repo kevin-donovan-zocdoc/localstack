@@ -1104,15 +1104,22 @@ class SubscriptionFilter:
     def check_filter_policy_on_message_attributes(
         self, filter_policy: Dict, message_attributes: Dict
     ):
-        for criteria, conditions in filter_policy.items():
-            if not self._evaluate_filter_policy_conditions_on_attribute(
-                conditions,
-                message_attributes.get(criteria),
-                field_exists=criteria in message_attributes,
-            ):
-                return False
+        if not filter_policy:
+            return True
 
-        return True
+        flat_policy_conditions = self.flatten_policy(filter_policy)
+
+        return any(
+            all(
+                self._evaluate_filter_policy_conditions_on_attribute(
+                    conditions,
+                    message_attributes.get(criteria),
+                    field_exists=criteria in message_attributes,
+                )
+                for criteria, conditions in flat_policy.items()
+            )
+            for flat_policy in flat_policy_conditions
+        )
 
     def check_filter_policy_on_message_body(self, filter_policy: dict, message_body: str):
         try:
@@ -1141,18 +1148,26 @@ class SubscriptionFilter:
         :param payload: a dict, starting at the MessageBody
         :return: True if the payload respect the filter policy, otherwise False
         """
-        flat_policy = self._flatten_dict(filter_policy)
-        flat_payloads = self._flatten_dict_with_list(payload)
-        for key, values in flat_policy.items():
-            if not any(
-                self._evaluate_condition(
-                    flat_payload.get(key), condition, field_exists=key in flat_payload
+        if not filter_policy:
+            return True
+
+        # TODO: maybe save/cache the flattened/expanded policy?
+        flat_policy_conditions = self.flatten_policy(filter_policy)
+        flat_payloads = self.flatten_payload(payload)
+
+        return any(
+            all(
+                any(
+                    self._evaluate_condition(
+                        flat_payload.get(key), condition, field_exists=key in flat_payload
+                    )
+                    for condition in values
+                    for flat_payload in flat_payloads
                 )
-                for condition in values
-                for flat_payload in flat_payloads
-            ):
-                return False
-        return True
+                for key, values in flat_policy.items()
+            )
+            for flat_policy in flat_policy_conditions
+        )
 
     def _evaluate_filter_policy_conditions_on_attribute(
         self, conditions, attribute, field_exists: bool
@@ -1190,9 +1205,16 @@ class SubscriptionFilter:
             # the remaining conditions require the value to not be None
             return False
         elif anything_but := condition.get("anything-but"):
+            # TODO: anything-but can be combined with prefix (and maybe others) by putting another condition in
+            #  > "event":[{"anything-but": {"prefix": "order-"}}]
+            # > https://docs.aws.amazon.com/sns/latest/dg/string-value-matching.html#string-anything-but-matching-prefix
             return value not in anything_but
-        elif prefix := (condition.get("prefix")):
+        elif prefix := condition.get("prefix"):
             return value.startswith(prefix)
+        elif suffix := condition.get("suffix"):
+            return value.endswith(suffix)
+        elif equal_ignore_case := condition.get("equals-ignore-case"):
+            return equal_ignore_case.lower() == value.lower()
         elif numeric_condition := condition.get("numeric"):
             return self._evaluate_numeric_condition(numeric_condition, value)
         return False
@@ -1229,35 +1251,59 @@ class SubscriptionFilter:
         return True
 
     @staticmethod
-    def _flatten_dict(nested_dict: dict):
+    def flatten_policy(nested_dict: dict):
         """
         Takes a dictionary as input and will output the dictionary on a single level.
         Input:
-        `{"field1": {"field2: {"field3: "val1", "field4": "val2"}}}`
+        `{"field1": {"field2": {"field3": "val1", "field4": "val2"}}}`
         Output:
         `{
             "field1.field2.field3": "val1",
-            "field1.field2.field4": "val1"
+            "field1.field2.field4": "val2"
         }`
         :param nested_dict: a (nested) dictionary
         :return: a list of flattened dictionaries with no nested dict or list inside, flattened to a
         single level, one list item for every list item encountered
         """
-        flatten = {}
+        flattened = []
 
-        def _traverse(_policy: dict, parent_key=None):
-            for key, values in _policy.items():
-                flattened_parent_key = key if not parent_key else f"{parent_key}.{key}"
-                if not isinstance(values, dict):
-                    flatten[flattened_parent_key] = values
-                else:
-                    _traverse(values, parent_key=flattened_parent_key)
+        def _traverse(_policy: dict, parent_key=None, current_rule=None, depth=0):
+            if not current_rule:
+                current_rule = {}
+
+            if (or_val := _policy.get("$or")) and isinstance(or_val, list) and len(or_val) > 1:
+                pol = {k: v for k, v in _policy.items() if k != "$or"}
+                for value in or_val:
+                    p = {**value, **pol}
+                    _traverse(p, parent_key=parent_key, current_rule={**current_rule}, depth=depth)
+
+            else:
+                for key, values in _policy.items():
+                    flattened_parent_key = key if not parent_key else f"{parent_key}.{key}"
+
+                    if not isinstance(values, dict):
+                        current_rule[flattened_parent_key] = values
+                    else:
+                        _traverse(
+                            values,
+                            parent_key=flattened_parent_key,
+                            current_rule=current_rule,
+                            depth=depth + 1,
+                        )
+
+            # this check is to validate we're properly at the end node, and that we can safely "commit" the rule before
+            # iterating out of the current branch
+            if current_rule and not (
+                any(isinstance(v, dict) for v in _policy.values()) or "$or" in _policy
+            ):
+                flattened.append({**current_rule})
 
         _traverse(nested_dict)
-        return flatten
+
+        return flattened
 
     @staticmethod
-    def _flatten_dict_with_list(nested_dict: dict) -> list[dict]:
+    def flatten_payload(nested_dict: dict) -> list[dict]:
         """
         Takes a dictionary as input and will output the dictionary on a single level.
         The dictionary can have lists containing other dictionaries, and one root level entry will be created for every
